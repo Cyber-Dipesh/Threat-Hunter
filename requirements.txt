@@ -1,0 +1,11 @@
+# To make requests to Threat Intel APIs AbuseIPDB
+requests
+
+# To handle API Keys securely (loading from .env file)
+python-dotenv
+
+# To make the terminal output look good on Linux (Green/Red text)
+colorama
+
+# (Optional) If you are parsing specific formats
+urllib3

@@ -4,7 +4,7 @@ import os
 import requests
 import json
 import getpass
-from datetime import datetime
+from datetime import datetime, timedelta # <--- Added timedelta
 from collections import defaultdict
 
 # ==========================================
@@ -16,7 +16,6 @@ SEVERITY = {
     "LOW": ["Vulnerability Scan", "Single Failure"]
 }
 
-# WEB ATTACK PATTERNS
 WEB_ATTACK_SIGNATURES = {
     "SQL Injection": [r"UNION SELECT", r"' OR '1'='1", r"substring\(", r"load_file", r"--"],
     "XSS": [r"<script>", r"alert\(", r"%3Cscript%3E"],
@@ -25,15 +24,14 @@ WEB_ATTACK_SIGNATURES = {
     "Admin Scanning": [r"wp-admin", r"wp-login", r"/admin/", r"phpmyadmin"]
 }
 
-# THRESHOLDS
+# --- UPDATED THRESHOLDS ---
 BRUTE_FORCE_THRESHOLD = 5
-TIME_GAP_THRESHOLD = 3600
+TIME_GAP_THRESHOLD = 60  # Time window in seconds (1 Minute)
 
 # ==========================================
 # HELPER: SAVE TO FILE
 # ==========================================
 def save_to_file(content):
-    """Asks user to save the report to a text file."""
     choice = input("\n[?] Save this report to 'threat_reports.txt'? (y/N): ").strip().lower()
     if choice == 'y':
         try:
@@ -55,16 +53,17 @@ class LogAnalyzer:
     def __init__(self, file_path):
         self.file_path = file_path
         self.suspicious_events = []
-        # General stats
+        # UPDATED DATA STRUCTURE
+        # 'fail_timestamps' is now a list to store datetime objects of every failure
         self.ip_activity = defaultdict(lambda: {
-            'fails': 0, 'success': 0, 'users': set(), 
-            'web_401': 0, 'web_404': 0, 'web_200': 0
+            'fail_timestamps': [], 
+            'success': 0, 
+            'web_401': 0, 'web_404': 0
         })
 
     def parse_logs(self):
         print(f"\n[*] Parsing file: {self.file_path}...")
         
-        # PATTERNS
         ssh_pattern = re.compile(r'^(\w{3}\s+\d+\s\d{2}:\d{2}:\d{2}) \S+ (\S+): (.*)')
         web_pattern = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) - - \[(.*?)\] "(.*?)" (\d{3}) (\d+)')
         ip_pattern = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
@@ -72,13 +71,11 @@ class LogAnalyzer:
         try:
             with open(self.file_path, 'r', encoding="utf-8", errors='ignore') as f:
                 for line in f:
-                    # --- TRY WEB LOG FORMAT FIRST ---
                     web_match = web_pattern.search(line)
                     if web_match:
                         self._process_web_line(web_match)
                         continue
 
-                    # --- TRY SSH LOG FORMAT SECOND ---
                     ssh_match = ssh_pattern.match(line)
                     if ssh_match:
                         self._process_ssh_line(ssh_match, ip_pattern)
@@ -90,56 +87,81 @@ class LogAnalyzer:
         return True
 
     def _process_web_line(self, match):
-        """Handle Apache/Nginx Logs"""
         ip, timestamp, request, status, size = match.groups()
         status = int(status)
 
-        # 1. Check Signatures (SQLi, XSS, etc.)
         for attack_type, patterns in WEB_ATTACK_SIGNATURES.items():
             for pattern in patterns:
                 if re.search(pattern, request, re.IGNORECASE):
-                    # Severity check: Web Shells with 200 OK are Critical
                     severity = "HIGH"
                     if attack_type == "Web Shell" and status == 200:
                          description = f"SUCCESSFUL SHELL ACCESS: {request[:40]}..."
                     else:
                          description = f"Attempted {attack_type}"
-                    
                     self.register_event(ip, attack_type, severity, description)
-                    break # Stop checking other patterns for this line
+                    break 
 
-        # 2. Track Stats
         if status == 401: self.ip_activity[ip]['web_401'] += 1
         elif status == 404: self.ip_activity[ip]['web_404'] += 1
 
     def _process_ssh_line(self, match, ip_pattern):
-        """Handle Linux System Logs"""
         timestamp_str, process, message = match.groups()
         
-        # Extract IP
+        # Parse timestamp (Syslog format: Oct 25 12:00:00)
+        # Note: We assume current year because syslog doesn't provide year
+        try:
+            log_time = datetime.strptime(timestamp_str, "%b %d %H:%M:%S")
+            # Adjust to current year to allow comparison
+            log_time = log_time.replace(year=datetime.now().year)
+        except ValueError:
+            return # Skip line if date parse fails
+
         ip_match = ip_pattern.search(message)
         if ip_match:
             ip = ip_match.group(1)
             
             if "Failed password" in message or "authentication failure" in message:
-                self.ip_activity[ip]['fails'] += 1
+                # STORE TIMESTAMP OF FAILURE
+                self.ip_activity[ip]['fail_timestamps'].append(log_time)
+            
             elif "Accepted password" in message:
-                if self.ip_activity[ip]['fails'] > 2:
-                    self.register_event(ip, "Success After Failure", "HIGH", f"Login success after {self.ip_activity[ip]['fails']} fails")
-                self.ip_activity[ip]['fails'] = 0
+                # Check previous failures for this IP
+                fails_count = len(self.ip_activity[ip]['fail_timestamps'])
+                if fails_count > 2:
+                    self.register_event(ip, "Success After Failure", "HIGH", f"Login success after {fails_count} fails")
+                # Reset failures on success
+                self.ip_activity[ip]['fail_timestamps'] = []
 
     def analyze_behavior(self):
         print("[*] Running heuristic analysis...")
         for ip, data in self.ip_activity.items():
-            # SSH Brute Force
-            if data['fails'] >= BRUTE_FORCE_THRESHOLD:
-                self.register_event(ip, "Brute Force (SSH)", "HIGH", f"{data['fails']} failed system logins")
             
-            # Web Brute Force
+            # --- NEW TIME WINDOW LOGIC ---
+            timestamps = sorted(data['fail_timestamps'])
+            is_brute_force = False
+            
+            # Check if we have enough failures to even consider brute force
+            if len(timestamps) >= BRUTE_FORCE_THRESHOLD:
+                # Sliding window check
+                # Check every group of 5 failures
+                for i in range(len(timestamps) - BRUTE_FORCE_THRESHOLD + 1):
+                    start_time = timestamps[i]
+                    end_time = timestamps[i + BRUTE_FORCE_THRESHOLD - 1]
+                    
+                    # Calculate difference in seconds
+                    time_diff = (end_time - start_time).total_seconds()
+                    
+                    # If 5th fail happened within 60 seconds of 1st fail
+                    if time_diff <= TIME_GAP_THRESHOLD:
+                        is_brute_force = True
+                        break
+            
+            if is_brute_force:
+                self.register_event(ip, "Brute Force (SSH)", "HIGH", f"{len(timestamps)} fails (Detected rapid burst)")
+            
+            # Web stats (Standard)
             if data['web_401'] >= 5:
                 self.register_event(ip, "Brute Force (Web)", "MEDIUM", f"{data['web_401']} failed web logins")
-            
-            # Web Scanning
             if data['web_404'] >= 5:
                 self.register_event(ip, "Vulnerability Scan", "LOW", f"{data['web_404']} missing pages accessed")
 
@@ -153,34 +175,22 @@ class LogAnalyzer:
             print("\n[+] No threats detected.")
             return
 
-        # Prepare header
         header = f"\n{'='*90}\n{'UNIFIED THREAT REPORT':^90}\n{'='*90}\n"
         header += f"{'SEVERITY':<10} | {'TYPE':<22} | {'TARGET':<16} | {'DETAILS'}\n"
         header += "-" * 90
-        
         print(header)
-
-        # Prepare list for file saving (clean text)
         file_output = [header]
         
-        # Sort HIGH -> MEDIUM -> LOW
         severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
         sorted_events = sorted(self.suspicious_events, key=lambda x: severity_order.get(x['Severity'], 3))
 
         for event in sorted_events:
-            # Color logic for Terminal
             color = "\033[91m" if event['Severity'] == "HIGH" else "\033[93m" if event['Severity'] == "MEDIUM" else "\033[92m"
             reset = "\033[0m"
-            
-            # Print to Terminal (With Color)
             print(f"{color}{event['Severity']:<10}{reset} | {event['Type']:<22} | {event['Target']:<16} | {event['Description']}")
-            
-            # Save to Memory (Without Color)
             file_output.append(f"{event['Severity']:<10} | {event['Type']:<22} | {event['Target']:<16} | {event['Description']}")
 
-        # Trigger Save Prompt
         save_to_file("\n".join(file_output))
-
 
 # ==========================================
 # THREAT INTEL MODULE
@@ -202,8 +212,6 @@ def check_ip_reputation(ip_address, api_key):
         response = requests.get(url, headers=headers, params=params)
         if response.status_code == 200:
             data = response.json()['data']
-            
-            # Build the report string
             report_lines = []
             report_lines.append(f"{'='*50}")
             report_lines.append(f"REPORT FOR: {ip_address}")
@@ -213,13 +221,8 @@ def check_ip_reputation(ip_address, api_key):
             report_lines.append(f"ISP              : {data.get('isp', 'Unknown')}")
             report_lines.append(f"Country          : {data.get('countryCode', 'Unknown')}")
             report_lines.append(f"Last Reported    : {data.get('lastReportedAt', 'Never')}")
-            
-            # Print to screen
             print("\n" + "\n".join(report_lines))
-            
-            # Trigger Save Prompt
             save_to_file("\n".join(report_lines))
-            
         elif response.status_code == 401:
             print("[!] Error: Invalid API Key.")
         else:
@@ -232,17 +235,14 @@ def check_ip_reputation(ip_address, api_key):
 # ==========================================
 def main_menu():
     while True:
-        # Clear screen
         os.system('cls' if os.name == 'nt' else 'clear')
-        
         print(f"{'='*40}")
-        print(f"{'CYBER THREAT HUNTER v7.0':^40}")
+        print(f"{'CYBER THREAT HUNTER v8.0':^40}")
         print(f"{'='*40}")
         print("1. Analyze Log File (SSH or Web)")
         print("2. Check IP Reputation (AbuseIPDB)")
         print("3. Exit")
         print("-" * 40)
-        
         choice = input("Select Option: ").strip()
         
         if choice == '1':
@@ -250,7 +250,6 @@ def main_menu():
                 print("\n--- LOG ANALYSIS MODE ---")
                 fpath = input("Enter log file path (or 'b' for back): ").strip()
                 if fpath.lower() == 'b': break
-                
                 analyzer = LogAnalyzer(fpath)
                 if analyzer.parse_logs():
                     analyzer.analyze_behavior()
@@ -262,7 +261,6 @@ def main_menu():
                 print("\n--- THREAT INTEL MODE ---")
                 ip = input("Enter IP Address (or 'b' for back): ").strip()
                 if ip.lower() == 'b': break
-                
                 key = get_api_key()
                 if key: check_ip_reputation(ip, key)
                 input("\n[Press Enter to continue...]")

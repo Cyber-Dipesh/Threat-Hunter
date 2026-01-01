@@ -7,7 +7,7 @@ A Python-based automated threat hunting tool to analyze server logs and detect O
 ![Security](https://img.shields.io/badge/Security-SIEM-red?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 
-## 📌 Project Overview
+## 📌 Tool Overview
 **Threat Hunter** is a command-line Python tool designed to automate the detection of security incidents in server logs. It acts as a lightweight **SIEM (Security Information and Event Management)** solution by parsing raw logs, detecting attack patterns (OWASP Top 10), and enriching IP addresses with real-time threat intelligence.
 
 This tool bridges the gap between **IT Operations** and **Security Analysis**, allowing for rapid triage of Brute Force attacks, SQL Injections, and Web Shell uploads.
